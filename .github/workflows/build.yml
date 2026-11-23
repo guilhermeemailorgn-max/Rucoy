@@ -1,0 +1,1544 @@
+# .github/workflows/build.yml
+name: build-apk
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Gerar projeto (build e manifest)
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          FILES = {
+          ".gitignore": r'''# .gitignore
+          .gradle/
+          build/
+          local.properties
+          .idea/
+          *.iml
+          captures/
+          .externalNativeBuild/
+          .cxx/
+          *.jks
+          ''',
+          "app/build.gradle.kts": r'''// app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.kai.rucoymacro"
+              compileSdk = 36
+
+              defaultConfig {
+                  applicationId = "com.kai.rucoymacro"
+                  minSdk = 26
+                  targetSdk = 36
+                  versionCode = 1
+                  versionName = "1.0"
+                  // Moto G47 é arm64: filtra ABIs e corta ~75% do peso do OpenCV no APK.
+                  ndk { abiFilters += "arm64-v8a" }
+              }
+
+              buildFeatures { viewBinding = true }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+          }
+
+          tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+              compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
+          }
+
+          // PNG é binário e não cabe em entrega texto: placeholder gerado no build só se ausente; substitua por recorte real.
+          val gerarTemplates by tasks.registering {
+              val destino = layout.projectDirectory.dir("src/main/assets")
+              outputs.dir(destino)
+              doLast {
+                  val arquivo = destino.file("mob.png").asFile
+                  if (!arquivo.exists()) {
+                      arquivo.parentFile.mkdirs()
+                      val img = java.awt.image.BufferedImage(48, 48, java.awt.image.BufferedImage.TYPE_INT_RGB)
+                      for (x in 0 until 48) for (y in 0 until 48) {
+                          val cor = if ((x / 8 + y / 8) % 2 == 0) java.awt.Color(255, 0, 255) else java.awt.Color(0, 255, 255)
+                          img.setRGB(x, y, cor.rgb)
+                      }
+                      javax.imageio.ImageIO.write(img, "png", arquivo)
+                  }
+              }
+          }
+
+          tasks.named("preBuild") { dependsOn(gerarTemplates) }
+
+          dependencies {
+              implementation("org.opencv:opencv:4.9.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+              implementation("androidx.core:core-ktx:1.16.0")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+          }
+          ''',
+          "app/proguard-rules.pro": r'''# app/proguard-rules.pro
+          -keep class org.opencv.** { *; }
+          -dontwarn org.opencv.**
+          -keep class com.kai.rucoymacro.MacroAccessibilityService { *; }
+          -keep class com.kai.rucoymacro.OverlayService { *; }
+          ''',
+          "app/src/main/AndroidManifest.xml": r'''<!-- app/src/main/AndroidManifest.xml -->
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <!-- Leitura do template em /sdcard/RucoyMacro via caminho bruto (FUSE do MediaStore). -->
+              <uses-permission
+                  android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.RucoyMacro">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="painel_flutuante_de_controle_de_automacao_local" />
+                  </service>
+
+                  <service
+                      android:name=".MacroAccessibilityService"
+                      android:exported="true"
+                      android:label="@string/accessibility_label"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          ''',
+          "build.gradle.kts": r'''// build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.11.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.2.0" apply false
+          }
+          ''',
+          "gradle.properties": r'''# gradle.properties
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8 -Djava.awt.headless=true
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          ''',
+          "gradle/wrapper/gradle-wrapper.properties": r'''# gradle/wrapper/gradle-wrapper.properties
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.13-bin.zip
+          networkTimeout=10000
+          validateDistributionUrl=true
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          ''',
+          "settings.gradle.kts": r'''// settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "RucoyMacro"
+          include(":app")
+          ''',
+          }
+          for p, c in FILES.items():
+              os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+              with open(p, 'w', encoding='utf-8', newline='\n') as f:
+                  f.write(c)
+          print('gerados:', len(FILES))
+          PYEOF
+
+      - name: Gerar projeto (Kotlin)
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          FILES = {
+          "app/src/main/java/com/kai/rucoymacro/Config.kt": r'''// app/src/main/java/com/kai/rucoymacro/Config.kt
+          package com.kai.rucoymacro
+
+          object Config {
+              const val PKG_ALVO = "com.gameresort.stupidmonsters"
+
+              // Templates: /sdcard/RucoyMacro tem prioridade; assets é o fallback.
+              const val DIR_TEMPLATES = "/sdcard/RucoyMacro"
+              const val ARQ_MOB = "mob.png"
+              const val ARQ_EXHAUST = "exhaust.png"
+              const val ARQ_PLAYER = "player.png"
+
+              const val THRESHOLD_PADRAO = 0.80f
+
+              // Coordenadas em dp; convertidas para px em runtime com a densidade real.
+              const val ATAQUE_X_DP = 330f
+              const val ATAQUE_Y_DP = 610f
+              const val POCAO_X_DP = 250f
+              const val POCAO_Y_DP = 610f
+              const val TRAIN_X_DP = 330f
+              const val TRAIN_Y_DP = 610f
+
+              const val SIGMA_TAP_PX = 3.0
+              const val SIGMA_SWIPE_MS = 40.0
+              const val SIGMA_ZIGUEGUE_PX = 14.0
+              const val PASSO_ZIGUEGUE_PX = 140.0
+
+              const val GOLPES_MEDIA = 3.0
+              const val GOLPES_SIGMA = 1.0
+              const val GOLPES_MIN = 2
+              const val PAUSA_GOLPE_MS = 420.0
+              const val PAUSA_GOLPE_SIGMA_REL = 0.25
+
+              const val PAUSA_CICLO_MS = 600.0
+              const val PAUSA_CICLO_SIGMA_REL = 0.30
+
+              const val RAIO_BUSCA_MIN_PX = 200
+              const val RAIO_BUSCA_MAX_PX = 400
+
+              const val MICRO_SWIPE_MIN_PX = 30
+              const val MICRO_SWIPE_MAX_PX = 80
+              const val TRAIN_MICRO_MEDIA_MS = 65_000.0
+              const val TRAIN_MICRO_SIGMA_MS = 12_500.0
+              const val TRAIN_MICRO_MIN_MS = 40_000.0
+              const val TRAIN_MICRO_MAX_MS = 90_000.0
+
+              const val PAUSA_HUMANA_MEDIA_MS = 180_000.0
+              const val PAUSA_HUMANA_SIGMA_REL = 0.35
+              const val PAUSA_HUMANA_MIN_MS = 30_000.0
+              const val PAUSA_HUMANA_DORME_MIN_MS = 10_000L
+              const val PAUSA_HUMANA_DORME_MAX_MS = 40_000L
+
+              const val MODO_INICIAL = "FARM"
+
+              // Frações da tela: a busca de template ignora a faixa inferior, onde o overlay mora.
+              const val REGIAO_LEFT = 0.0f
+              const val REGIAO_TOP = 0.0f
+              const val REGIAO_RIGHT = 1.0f
+              const val REGIAO_BOTTOM = 0.72f
+          }
+
+          /*
+           * NOTA DE COMPATIBILIDADE — Android 16 (API 36)
+           *
+           * 1) AccessibilityService.takeScreenshot (API 30+) é o caminho correto aqui.
+           *    MediaProjection exigiria foregroundServiceType="mediaProjection" e
+           *    consentimento por sessão via createScreenCaptureIntent — peso morto
+           *    e desnecessário para automação 100% local.
+           *
+           * 2) Janelas TYPE_APPLICATION_OVERLAY não recebem os toques sintéticos do
+           *    dispatchGesture destinados ao app abaixo delas (FLAG_NOT_FOCUSABLE
+           *    repassa o que cai fora da janela). Ainda assim, o overlay deve ficar
+           *    fora da região de match ou ser excluído da área de captura.
+           *
+           * 3) Android 14+: o foreground service specialUse que sustenta o overlay
+           *    precisa ser iniciado com o app em foreground na primeira vez — por
+           *    isso o botão de iniciar mora na MainActivity, não no boot receiver.
+           *
+           * 4) takeScreenshot retorna o display INTEIRO, incluindo o overlay. O painel
+           *    nasce no canto inferior (y = 80% da altura) e a busca de template fica
+           *    limitada ao Rect configurável REGIAO_* (72% superiores da tela).
+           *
+           * 5) APK sideloaded (artifact do GitHub Actions) em Android 13+: antes de
+           *    ativar o serviço em Acessibilidade, habilite "Permitir configurações
+           *    restritas" em Info do app > menu ⋮ (exigência do sistema para sideload).
+           */
+          ''',
+          "app/src/main/java/com/kai/rucoymacro/MacroAccessibilityService.kt": r'''// app/src/main/java/com/kai/rucoymacro/MacroAccessibilityService.kt
+          package com.kai.rucoymacro
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Path
+          import android.os.Build
+          import android.view.Display
+          import android.view.accessibility.AccessibilityEvent
+          import java.util.concurrent.Executors
+          import kotlin.coroutines.resume
+          import kotlinx.coroutines.suspendCancellableCoroutine
+          import kotlinx.coroutines.sync.Mutex
+          import kotlinx.coroutines.sync.withLock
+
+          class MacroAccessibilityService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: MacroAccessibilityService? = null
+                      private set
+              }
+
+              private val gestureMutex = Mutex()
+              // Conversão HardwareBuffer -> Bitmap fora da main thread.
+              private val captureExecutor = Executors.newSingleThreadExecutor()
+
+              @Volatile
+              private var conectada = false
+
+              val isReady: Boolean get() = conectada && Build.VERSION.SDK_INT >= 30
+
+              override fun onServiceConnected() {
+                  conectada = true
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+
+              override fun onInterrupt() = Unit
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  conectada = false
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  conectada = false
+                  instance = null
+                  captureExecutor.shutdown()
+                  super.onDestroy()
+              }
+
+              suspend fun captureBitmap(): Bitmap? {
+                  if (Build.VERSION.SDK_INT < 30 || !conectada) return null
+                  return suspendCancellableCoroutine { cont ->
+                      takeScreenshot(Display.DEFAULT_DISPLAY, captureExecutor, object : TakeScreenshotCallback {
+                          override fun onSuccess(screenshot: ScreenshotResult) {
+                              val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
+                              val sw = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                              hw?.recycle()
+                              screenshot.hardwareBuffer.close()
+                              if (cont.isActive) cont.resume(sw) else sw?.recycle()
+                          }
+
+                          override fun onFailure(errorCode: Int) {
+                              // Cobre ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT (~1 captura/s); o motor re-tenta.
+                              if (cont.isActive) cont.resume(null)
+                          }
+                      })
+                  }
+              }
+
+              suspend fun tapJitter(x: Float, y: Float, sigmaPx: Double = Config.SIGMA_TAP_PX): Boolean {
+                  val jx = (x + MacroEngine.gauss(0.0, sigmaPx)).toFloat()
+                  val jy = (y + MacroEngine.gauss(0.0, sigmaPx)).toFloat()
+                  val path = Path()
+                  // Path de comprimento zero (só moveTo) é toque estacionário, conforme docs de StrokeDescription.
+                  path.moveTo(jx, jy)
+                  val gesto = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0L, 50L))
+                      .build()
+                  return executar(gesto)
+              }
+
+              suspend fun swipeJitter(
+                  x1: Float,
+                  y1: Float,
+                  x2: Float,
+                  y2: Float,
+                  duracaoMs: Long,
+                  sigmaMs: Double = Config.SIGMA_SWIPE_MS
+              ): Boolean {
+                  val dur = (duracaoMs + MacroEngine.gauss(0.0, sigmaMs)).toLong().coerceAtLeast(80L)
+                  val path = Path()
+                  path.moveTo(
+                      (x1 + MacroEngine.gauss(0.0, Config.SIGMA_TAP_PX)).toFloat(),
+                      (y1 + MacroEngine.gauss(0.0, Config.SIGMA_TAP_PX)).toFloat()
+                  )
+                  path.lineTo(
+                      (x2 + MacroEngine.gauss(0.0, Config.SIGMA_TAP_PX)).toFloat(),
+                      (y2 + MacroEngine.gauss(0.0, Config.SIGMA_TAP_PX)).toFloat()
+                  )
+                  val gesto = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0L, dur))
+                      .build()
+                  return executar(gesto)
+              }
+
+              // Fila serializada: o mutex + o callback onCompleted/onCancelled garantem um gesto por vez.
+              private suspend fun executar(gesto: GestureDescription): Boolean = gestureMutex.withLock {
+                  suspendCancellableCoroutine { cont ->
+                      val aceito = dispatchGesture(gesto, object : GestureResultCallback() {
+                          override fun onCompleted(gestureDescription: GestureDescription?) {
+                              if (cont.isActive) cont.resume(true)
+                          }
+
+                          override fun onCancelled(gestureDescription: GestureDescription?) {
+                              if (cont.isActive) cont.resume(false)
+                          }
+                      }, null)
+                      if (!aceito && cont.isActive) cont.resume(false)
+                  }
+              }
+          }
+          ''',
+          "app/src/main/java/com/kai/rucoymacro/MacroEngine.kt": r'''// app/src/main/java/com/kai/rucoymacro/MacroEngine.kt
+          package com.kai.rucoymacro
+
+          import android.content.Context
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.widget.Toast
+          import kotlin.math.PI
+          import kotlin.math.cos
+          import kotlin.math.ln
+          import kotlin.math.sqrt
+          import kotlin.random.Random
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.currentCoroutineContext
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.flow.update
+          import kotlinx.coroutines.isActive
+          import kotlinx.coroutines.launch
+
+          class MacroEngine(
+              private val svc: MacroAccessibilityService,
+              private val prefs: Prefs,
+              private val appContext: Context
+          ) {
+              enum class Estado { IDLE, FARM, TRAIN }
+
+              data class Stats(
+                  val estado: Estado = Estado.IDLE,
+                  val ciclos: Long = 0,
+                  val alvos: Long = 0,
+                  val sessaoMs: Long = 0
+              )
+
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+              private var job: Job? = null
+              private var ticker: Job? = null
+
+              private val _stats = MutableStateFlow(Stats())
+              val stats: StateFlow<Stats> = _stats.asStateFlow()
+
+              val rodando: Boolean get() = job?.isActive == true
+
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private var inicioSessao = 0L
+              private var proximaPausaHumana = 0L
+              private var ciclos = 0L
+              private var alvos = 0L
+
+              fun iniciar() {
+                  if (rodando) return
+                  ciclos = 0
+                  alvos = 0
+                  inicioSessao = SystemClock.elapsedRealtime()
+                  proximaPausaHumana = inicioSessao + intervaloHumano()
+                  _stats.value = Stats(estadoAtual(), 0, 0, 0)
+                  job = scope.launch { loop() }
+                  ticker = scope.launch {
+                      while (isActive) {
+                          _stats.update { it.copy(sessaoMs = SystemClock.elapsedRealtime() - inicioSessao) }
+                          delay(1000)
+                      }
+                  }
+              }
+
+              fun parar() {
+                  job?.cancel()
+                  job = null
+                  ticker?.cancel()
+                  ticker = null
+                  _stats.update { it.copy(estado = Estado.IDLE) }
+              }
+
+              fun dispose() {
+                  parar()
+                  scope.cancel()
+              }
+
+              private fun estadoAtual(): Estado {
+                  val e = runCatching { Estado.valueOf(prefs.modo) }.getOrDefault(Estado.FARM)
+                  return if (e == Estado.IDLE) Estado.FARM else e
+              }
+
+              private suspend fun loop() {
+                  val farm = ModeFarm(this, svc, prefs, appContext)
+                  val train = ModeTrain(this, svc, prefs)
+                  while (currentCoroutineContext().isActive) {
+                      if (!svc.isReady || !Vision.ok) {
+                          delay(500)
+                          continue
+                      }
+                      pausaHumanaSeDevido()
+                      val modo = estadoAtual()
+                      _stats.update { it.copy(estado = modo) }
+
+                      var abateu = false
+                      if (modo == Estado.TRAIN) {
+                          // TRAIN não usa visão: evita o rate limit do takeScreenshot e captura à toa.
+                          train.ciclo()
+                      } else {
+                          val bmp = svc.captureBitmap()
+                          if (bmp == null) {
+                              delay(500)
+                              continue
+                          }
+                          abateu = try {
+                              farm.ciclo(bmp)
+                          } finally {
+                              bmp.recycle()
+                          }
+                      }
+
+                      ciclos++
+                      if (abateu) alvos++
+                      _stats.update {
+                          it.copy(ciclos = ciclos, alvos = alvos, sessaoMs = SystemClock.elapsedRealtime() - inicioSessao)
+                      }
+                      pausa(Config.PAUSA_CICLO_MS, Config.PAUSA_CICLO_SIGMA_REL)
+                  }
+              }
+
+              private fun intervaloHumano(): Long =
+                  gauss(Config.PAUSA_HUMANA_MEDIA_MS, Config.PAUSA_HUMANA_MEDIA_MS * Config.PAUSA_HUMANA_SIGMA_REL)
+                      .toLong()
+                      .coerceAtLeast(Config.PAUSA_HUMANA_MIN_MS.toLong())
+
+              private suspend fun pausaHumanaSeDevido() {
+                  if (SystemClock.elapsedRealtime() < proximaPausaHumana) return
+                  val msg = appContext.getString(R.string.fmt_pausa_humana, ciclos)
+                  mainHandler.post { Toast.makeText(appContext, msg, Toast.LENGTH_LONG).show() }
+                  delay(Random.nextLong(Config.PAUSA_HUMANA_DORME_MIN_MS, Config.PAUSA_HUMANA_DORME_MAX_MS + 1))
+                  proximaPausaHumana = SystemClock.elapsedRealtime() + intervaloHumano()
+              }
+
+              suspend fun pausa(mediaMs: Double, sigmaRel: Double) {
+                  delay(gauss(mediaMs, mediaMs * sigmaRel).toLong().coerceAtLeast(50L))
+              }
+
+              companion object {
+                  // Box-Muller: u1 com piso evita ln(0).
+                  fun gauss(media: Double, sigma: Double): Double {
+                      val u1 = Random.nextDouble().coerceAtLeast(1e-12)
+                      val u2 = Random.nextDouble()
+                      return media + sigma * sqrt(-2.0 * ln(u1)) * cos(2.0 * PI * u2)
+                  }
+              }
+          }
+          ''',
+          "app/src/main/java/com/kai/rucoymacro/MainActivity.kt": r'''// app/src/main/java/com/kai/rucoymacro/MainActivity.kt
+          package com.kai.rucoymacro
+
+          import android.Manifest
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+          import com.kai.rucoymacro.databinding.ActivityMainBinding
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var binding: ActivityMainBinding
+              private lateinit var prefs: Prefs
+
+              private val pedirNotificacao =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) { iniciarOverlay() }
+
+              private val pedirMidia =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  binding = ActivityMainBinding.inflate(layoutInflater)
+                  setContentView(binding.root)
+                  prefs = Prefs(this)
+
+                  binding.etAtaqueX.setText(prefs.ataqueXDp.toString())
+                  binding.etAtaqueY.setText(prefs.ataqueYDp.toString())
+                  binding.etTrainX.setText(prefs.trainXDp.toString())
+                  binding.etTrainY.setText(prefs.trainYDp.toString())
+                  binding.etThreshold.setText(prefs.threshold.toString())
+                  if (prefs.modo == "TRAIN") binding.rbTrain.isChecked = true else binding.rbFarm.isChecked = true
+
+                  binding.btnAcessibilidade.setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+
+                  binding.btnOverlayPerm.setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+
+                  binding.btnOverlayToggle.setOnClickListener {
+                      if (OverlayService.ativo) {
+                          stopService(Intent(this, OverlayService::class.java))
+                      } else {
+                          if (!Settings.canDrawOverlays(this)) {
+                              toast(getString(R.string.toast_sem_overlay_perm))
+                              return@setOnClickListener
+                          }
+                          if (Build.VERSION.SDK_INT >= 33 &&
+                              ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+                              PackageManager.PERMISSION_GRANTED
+                          ) {
+                              pedirNotificacao.launch(Manifest.permission.POST_NOTIFICATIONS)
+                          } else {
+                              iniciarOverlay()
+                          }
+                      }
+                      binding.root.postDelayed({ atualizarStatus() }, 300)
+                  }
+
+                  binding.btnSalvar.setOnClickListener { salvar() }
+
+                  // Template em /sdcard/RucoyMacro exige permissão de mídia (caminho bruto via FUSE).
+                  val permissoesMidia = if (Build.VERSION.SDK_INT >= 33) {
+                      arrayOf(Manifest.permission.READ_MEDIA_IMAGES)
+                  } else {
+                      arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+                  }
+                  if (permissoesMidia.any {
+                          ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+                      }
+                  ) {
+                      pedirMidia.launch(permissoesMidia)
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  atualizarStatus()
+              }
+
+              private fun iniciarOverlay() {
+                  ContextCompat.startForegroundService(this, Intent(this, OverlayService::class.java))
+                  binding.root.postDelayed({ atualizarStatus() }, 300)
+              }
+
+              private fun atualizarStatus() {
+                  val a11y = acessibilidadeAtiva()
+                  binding.tvStatusA11y.text = getString(
+                      R.string.fmt_status_a11y,
+                      getString(if (a11y) R.string.ligado else R.string.desligado)
+                  )
+                  binding.tvStatusOverlay.text = getString(
+                      R.string.fmt_status_overlay,
+                      getString(if (OverlayService.ativo) R.string.ligado else R.string.desligado)
+                  )
+                  binding.btnOverlayToggle.setText(
+                      if (OverlayService.ativo) R.string.btn_parar_overlay else R.string.btn_iniciar_overlay
+                  )
+              }
+
+              private fun acessibilidadeAtiva(): Boolean {
+                  if (Settings.Secure.getInt(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 0) != 1) return false
+                  val cn = ComponentName(this, MacroAccessibilityService::class.java)
+                  val ativos = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+                      ?: return false
+                  return ativos.split(':').any {
+                      it.equals(cn.flattenToString(), ignoreCase = true) ||
+                          it.equals(cn.flattenToShortString(), ignoreCase = true)
+                  }
+              }
+
+              private fun salvar() {
+                  prefs.ataqueXDp = binding.etAtaqueX.text.toString().toFloatOrNull() ?: prefs.ataqueXDp
+                  prefs.ataqueYDp = binding.etAtaqueY.text.toString().toFloatOrNull() ?: prefs.ataqueYDp
+                  prefs.trainXDp = binding.etTrainX.text.toString().toFloatOrNull() ?: prefs.trainXDp
+                  prefs.trainYDp = binding.etTrainY.text.toString().toFloatOrNull() ?: prefs.trainYDp
+                  prefs.threshold = binding.etThreshold.text.toString().toFloatOrNull() ?: prefs.threshold
+                  prefs.modo = if (binding.rbTrain.isChecked) "TRAIN" else "FARM"
+                  toast(getString(R.string.toast_salvo))
+              }
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+          }
+          ''',
+          "app/src/main/java/com/kai/rucoymacro/ModeFarm.kt": r'''// app/src/main/java/com/kai/rucoymacro/ModeFarm.kt
+          package com.kai.rucoymacro
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Rect
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.ceil
+          import kotlin.math.cos
+          import kotlin.math.hypot
+          import kotlin.math.roundToInt
+          import kotlin.math.sin
+          import kotlin.random.Random
+          import kotlinx.coroutines.delay
+
+          class ModeFarm(
+              private val engine: MacroEngine,
+              private val svc: MacroAccessibilityService,
+              private val prefs: Prefs,
+              private val appContext: Context
+          ) {
+              suspend fun ciclo(bmp: Bitmap): Boolean {
+                  val regiao = Vision.regiaoBusca(bmp.width, bmp.height)
+                  val thr = prefs.threshold.toDouble()
+
+                  Vision.template(appContext, Config.ARQ_PLAYER, opcional = true)?.let { t ->
+                      if (Vision.encontrar(bmp, t, thr, regiao) != null) {
+                          delay(Random.nextLong(2000, 6001))
+                          return false
+                      }
+                  }
+
+                  val mob = Vision.template(appContext, Config.ARQ_MOB, opcional = false) ?: return false
+                  val match = Vision.encontrar(bmp, mob, thr, regiao)
+                  if (match == null) {
+                      buscaAleatoria(bmp)
+                      return false
+                  }
+
+                  Vision.template(appContext, Config.ARQ_EXHAUST, opcional = true)?.let { t ->
+                      // Exausto só é procurado ao redor do match: evita falso positivo global.
+                      val area = Rect(match)
+                      area.inset(-t.cols(), -t.rows())
+                      area.left = area.left.coerceAtLeast(regiao.left)
+                      area.top = area.top.coerceAtLeast(regiao.top)
+                      area.right = area.right.coerceAtMost(regiao.right)
+                      area.bottom = area.bottom.coerceAtMost(regiao.bottom)
+                      if (area.width() >= t.cols() && area.height() >= t.rows() &&
+                          Vision.encontrar(bmp, t, thr, area) != null
+                      ) {
+                          buscaAleatoria(bmp)
+                          return false
+                      }
+                  }
+
+                  // O personagem fica no centro da tela; o match é o destino do deslocamento.
+                  zigzag(bmp.width / 2f, bmp.height / 2f, match.centerX().toFloat(), match.centerY().toFloat(), bmp)
+                  golpes()
+                  return true
+              }
+
+              private suspend fun zigzag(x0: Float, y0: Float, x1: Float, y1: Float, bmp: Bitmap) {
+                  val dx = (x1 - x0).toDouble()
+                  val dy = (y1 - y0).toDouble()
+                  val dist = hypot(dx, dy)
+                  if (dist < 60.0) return
+                  val ux = dx / dist
+                  val uy = dy / dist
+                  val px = -uy
+                  val py = ux
+                  val passos = ceil(dist / Config.PASSO_ZIGUEGUE_PX).toInt()
+                  repeat(passos) {
+                      var desvio = MacroEngine.gauss(0.0, Config.SIGMA_ZIGUEGUE_PX)
+                      // Piso de 4 px no desvio perpendicular: nunca em linha reta.
+                      if (abs(desvio) < 4.0) desvio = 4.0 * if (Random.nextBoolean()) 1.0 else -1.0
+                      val sx = (x0 + ux * Config.PASSO_ZIGUEGUE_PX + px * desvio).toFloat()
+                          .coerceIn(40f, bmp.width - 40f)
+                      val sy = (y0 + uy * Config.PASSO_ZIGUEGUE_PX + py * desvio).toFloat()
+                          .coerceIn(40f, bmp.height - 40f)
+                      svc.swipeJitter(x0, y0, sx, sy, 260L)
+                      engine.pausa(180.0, 0.3)
+                  }
+                  engine.pausa(250.0, 0.3)
+              }
+
+              private suspend fun golpes() {
+                  val n = MacroEngine.gauss(Config.GOLPES_MEDIA, Config.GOLPES_SIGMA)
+                      .roundToInt()
+                      .coerceAtLeast(Config.GOLPES_MIN)
+                  val dens = svc.resources.displayMetrics.density
+                  val ax = prefs.ataqueXDp * dens
+                  val ay = prefs.ataqueYDp * dens
+                  repeat(n) {
+                      svc.tapJitter(ax, ay)
+                      engine.pausa(Config.PAUSA_GOLPE_MS, Config.PAUSA_GOLPE_SIGMA_REL)
+                  }
+              }
+
+              private suspend fun buscaAleatoria(bmp: Bitmap) {
+                  val ang = Random.nextDouble(0.0, 2.0 * PI)
+                  val raio = Random.nextInt(Config.RAIO_BUSCA_MIN_PX, Config.RAIO_BUSCA_MAX_PX + 1)
+                  val cx = bmp.width / 2f
+                  val cy = bmp.height / 2f
+                  // Margem de 40 px: evita as zonas de gesto de sistema nas bordas.
+                  val fx = (cx + cos(ang) * raio).toFloat().coerceIn(40f, bmp.width - 40f)
+                  val fy = (cy + sin(ang) * raio).toFloat().coerceIn(40f, bmp.height - 40f)
+                  svc.swipeJitter(cx, cy, fx, fy, 320L)
+                  engine.pausa(350.0, 0.3)
+              }
+          }
+          ''',
+          "app/src/main/java/com/kai/rucoymacro/ModeTrain.kt": r'''// app/src/main/java/com/kai/rucoymacro/ModeTrain.kt
+          package com.kai.rucoymacro
+
+          import android.os.SystemClock
+          import kotlin.math.PI
+          import kotlin.math.cos
+          import kotlin.math.sin
+          import kotlin.random.Random
+
+          class ModeTrain(
+              private val engine: MacroEngine,
+              private val svc: MacroAccessibilityService,
+              private val prefs: Prefs
+          ) {
+              private var proximoMicro = SystemClock.elapsedRealtime() + janelaMicro()
+
+              suspend fun ciclo(): Boolean {
+                  val dens = svc.resources.displayMetrics.density
+                  svc.tapJitter(prefs.trainXDp * dens, prefs.trainYDp * dens)
+                  engine.pausa(Config.PAUSA_GOLPE_MS, Config.PAUSA_GOLPE_SIGMA_REL)
+                  if (SystemClock.elapsedRealtime() >= proximoMicro) {
+                      microSwipe()
+                      proximoMicro = SystemClock.elapsedRealtime() + janelaMicro()
+                  }
+                  return false
+              }
+
+              private fun janelaMicro(): Long =
+                  MacroEngine.gauss(Config.TRAIN_MICRO_MEDIA_MS, Config.TRAIN_MICRO_SIGMA_MS)
+                      .toLong()
+                      .coerceIn(Config.TRAIN_MICRO_MIN_MS.toLong(), Config.TRAIN_MICRO_MAX_MS.toLong())
+
+              private suspend fun microSwipe() {
+                  val dm = svc.resources.displayMetrics
+                  val cx = dm.widthPixels / 2f
+                  val cy = dm.heightPixels / 2f
+                  val ang = Random.nextDouble(0.0, 2.0 * PI)
+                  val len = Random.nextInt(Config.MICRO_SWIPE_MIN_PX, Config.MICRO_SWIPE_MAX_PX + 1)
+                  val fx = (cx + cos(ang) * len).toFloat()
+                  val fy = (cy + sin(ang) * len).toFloat()
+                  svc.swipeJitter(cx, cy, fx, fy, 200L)
+                  engine.pausa(120.0, 0.3)
+                  svc.swipeJitter(fx, fy, cx, cy, 200L)
+                  engine.pausa(150.0, 0.3)
+              }
+          }
+          ''',
+          "app/src/main/java/com/kai/rucoymacro/OverlayService.kt": r'''// app/src/main/java/com/kai/rucoymacro/OverlayService.kt
+          package com.kai.rucoymacro
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.IBinder
+          import android.provider.Settings
+          import android.view.ContextThemeWrapper
+          import android.view.Gravity
+          import android.view.LayoutInflater
+          import android.view.MotionEvent
+          import android.view.WindowManager
+          import android.widget.Toast
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.ServiceCompat
+          import com.kai.rucoymacro.databinding.OverlayLayoutBinding
+          import java.util.Locale
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.launch
+
+          class OverlayService : Service() {
+
+              companion object {
+                  @Volatile
+                  var ativo = false
+                      private set
+
+                  private const val CANAL = "overlay"
+                  private const val NOTIF_ID = 1
+              }
+
+              private lateinit var wm: WindowManager
+              private lateinit var prefs: Prefs
+              private lateinit var params: WindowManager.LayoutParams
+              private var binding: OverlayLayoutBinding? = null
+              private var engine: MacroEngine? = null
+              private var statsJob: Job? = null
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  prefs = Prefs(this)
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  Vision.init()
+
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CANAL, getString(R.string.notif_channel_name), NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val notif = NotificationCompat.Builder(this, CANAL)
+                      .setSmallIcon(R.drawable.ic_launcher_foreground)
+                      .setContentTitle(getString(R.string.notif_title))
+                      .setContentText(getString(R.string.notif_text))
+                      .setOngoing(true)
+                      .setContentIntent(pi)
+                      .build()
+                  val tipo = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
+                  ServiceCompat.startForeground(this, NOTIF_ID, notif, tipo)
+                  ativo = true
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (!Settings.canDrawOverlays(this)) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (binding == null) adicionarJanela()
+                  return START_STICKY
+              }
+
+              private fun adicionarJanela() {
+                  val inflater = LayoutInflater.from(ContextThemeWrapper(this, R.style.Theme_RucoyMacro))
+                  val b = OverlayLayoutBinding.inflate(inflater)
+                  binding = b
+
+                  params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  params.gravity = Gravity.TOP or Gravity.START
+                  params.x = if (prefs.overlayX >= 0) prefs.overlayX else 12
+                  // Canto inferior: fora da região de match (Config.REGIAO_BOTTOM = 0.72).
+                  params.y = if (prefs.overlayY >= 0) prefs.overlayY
+                  else (resources.displayMetrics.heightPixels * 0.80f).toInt()
+                  wm.addView(b.root, params)
+
+                  var downX = 0f
+                  var downY = 0f
+                  var origX = 0
+                  var origY = 0
+                  b.tvArrastar.setOnTouchListener { _, ev ->
+                      when (ev.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = ev.rawX
+                              downY = ev.rawY
+                              origX = params.x
+                              origY = params.y
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              params.x = origX + (ev.rawX - downX).toInt()
+                              params.y = origY + (ev.rawY - downY).toInt()
+                              wm.updateViewLayout(b.root, params)
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              prefs.overlayX = params.x
+                              prefs.overlayY = params.y
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+
+                  b.btnModo.text = prefs.modo
+                  b.btnModo.setOnClickListener {
+                      prefs.modo = if (prefs.modo == "FARM") "TRAIN" else "FARM"
+                      b.btnModo.text = prefs.modo
+                  }
+                  b.btnMotor.setOnClickListener { alternarMotor() }
+                  b.btnFechar.setOnClickListener { stopSelf() }
+                  render(MacroEngine.Stats())
+              }
+
+              private fun alternarMotor() {
+                  val e = engine
+                  if (e != null && e.rodando) {
+                      e.parar()
+                      statsJob?.cancel()
+                      binding?.btnMotor?.setText(R.string.overlay_iniciar)
+                      render(e.stats.value)
+                      return
+                  }
+                  val svc = MacroAccessibilityService.instance
+                  if (svc == null || !svc.isReady) {
+                      toast(getString(R.string.toast_ative_a11y))
+                      return
+                  }
+                  if (!Vision.ok) {
+                      toast(getString(R.string.toast_opencv_falhou))
+                      return
+                  }
+                  engine?.dispose()
+                  val novo = MacroEngine(svc, prefs, applicationContext)
+                  engine = novo
+                  novo.iniciar()
+                  binding?.btnMotor?.setText(R.string.overlay_parar)
+                  statsJob = scope.launch { novo.stats.collect { render(it) } }
+              }
+
+              private fun render(s: MacroEngine.Stats) {
+                  binding?.tvPainelStatus?.text = getString(
+                      R.string.fmt_painel_status, s.estado.name, s.ciclos, s.alvos, tempo(s.sessaoMs)
+                  )
+              }
+
+              private fun tempo(ms: Long): String {
+                  val t = ms / 1000
+                  return String.format(Locale.getDefault(), "%02d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60)
+              }
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+              override fun onDestroy() {
+                  engine?.dispose()
+                  statsJob?.cancel()
+                  scope.cancel()
+                  binding?.let { runCatching { wm.removeViewImmediate(it.root) } }
+                  binding = null
+                  ativo = false
+                  super.onDestroy()
+              }
+          }
+          ''',
+          "app/src/main/java/com/kai/rucoymacro/Prefs.kt": r'''// app/src/main/java/com/kai/rucoymacro/Prefs.kt
+          package com.kai.rucoymacro
+
+          import android.content.Context
+
+          class Prefs(context: Context) {
+              private val sp = context.applicationContext.getSharedPreferences("rucoymacro", Context.MODE_PRIVATE)
+
+              var modo: String
+                  get() = sp.getString("modo", Config.MODO_INICIAL) ?: Config.MODO_INICIAL
+                  set(v) { sp.edit().putString("modo", v).apply() }
+
+              var threshold: Float
+                  get() = sp.getFloat("threshold", Config.THRESHOLD_PADRAO)
+                  set(v) { sp.edit().putFloat("threshold", v.coerceIn(0.50f, 0.99f)).apply() }
+
+              var ataqueXDp: Float
+                  get() = sp.getFloat("ataque_x_dp", Config.ATAQUE_X_DP)
+                  set(v) { sp.edit().putFloat("ataque_x_dp", v).apply() }
+
+              var ataqueYDp: Float
+                  get() = sp.getFloat("ataque_y_dp", Config.ATAQUE_Y_DP)
+                  set(v) { sp.edit().putFloat("ataque_y_dp", v).apply() }
+
+              var trainXDp: Float
+                  get() = sp.getFloat("train_x_dp", Config.TRAIN_X_DP)
+                  set(v) { sp.edit().putFloat("train_x_dp", v).apply() }
+
+              var trainYDp: Float
+                  get() = sp.getFloat("train_y_dp", Config.TRAIN_Y_DP)
+                  set(v) { sp.edit().putFloat("train_y_dp", v).apply() }
+
+              var overlayX: Int
+                  get() = sp.getInt("overlay_x", -1)
+                  set(v) { sp.edit().putInt("overlay_x", v).apply() }
+
+              var overlayY: Int
+                  get() = sp.getInt("overlay_y", -1)
+                  set(v) { sp.edit().putInt("overlay_y", v).apply() }
+          }
+          ''',
+          "app/src/main/java/com/kai/rucoymacro/Vision.kt": r'''// app/src/main/java/com/kai/rucoymacro/Vision.kt
+          package com.kai.rucoymacro
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Rect
+          import java.io.File
+          import java.io.FileNotFoundException
+          import org.opencv.android.OpenCVLoader
+          import org.opencv.android.Utils
+          import org.opencv.core.Core
+          import org.opencv.core.Mat
+          import org.opencv.core.MatOfByte
+          import org.opencv.core.Rect as CvRect
+          import org.opencv.imgcodecs.Imgcodecs
+          import org.opencv.imgproc.Imgproc
+
+          object Vision {
+              @Volatile
+              var ok = false
+                  private set
+
+              fun init(): Boolean {
+                  // initLocal carrega as .so empacotadas no AAR oficial; sem OpenCV Manager.
+                  if (!ok) ok = OpenCVLoader.initLocal()
+                  return ok
+              }
+
+              private data class Cache(val mat: Mat?, val lastModified: Long)
+
+              private val cache = HashMap<String, Cache>()
+
+              @Synchronized
+              fun template(context: Context, nome: String, opcional: Boolean): Mat? {
+                  val arquivo = File(Config.DIR_TEMPLATES, nome)
+                  val lm = if (arquivo.isFile) arquivo.lastModified() else -1L
+                  val atual = cache[nome]
+                  if (atual != null && atual.lastModified == lm) return atual.mat
+
+                  var novo: Mat? = null
+                  if (lm >= 0) {
+                      val m = Imgcodecs.imread(arquivo.absolutePath, Imgcodecs.IMREAD_COLOR)
+                      if (!m.empty()) novo = m else m.release()
+                  }
+                  if (novo == null) {
+                      val bytes = try {
+                          context.assets.open(nome).use { it.readBytes() }
+                      } catch (e: FileNotFoundException) {
+                          null
+                      }
+                      if (bytes != null) {
+                          val buf = MatOfByte(*bytes.toTypedArray())
+                          val m = Imgcodecs.imdecode(buf, Imgcodecs.IMREAD_COLOR)
+                          buf.release()
+                          if (!m.empty()) novo = m else m.release()
+                      }
+                  }
+                  if (novo == null && !opcional) return null
+                  atual?.mat?.release()
+                  cache[nome] = Cache(novo, lm)
+                  return novo
+              }
+
+              fun encontrar(bitmap: Bitmap, template: Mat, threshold: Double, regiao: Rect): Rect? {
+                  if (template.empty()) return null
+                  val roi = CvRect(regiao.left, regiao.top, regiao.width(), regiao.height())
+                  if (template.cols() > roi.width || template.rows() > roi.height) return null
+                  val rgba = Mat()
+                  val bgr = Mat()
+                  var recorte: Mat? = null
+                  var resultado: Mat? = null
+                  try {
+                      Utils.bitmapToMat(bitmap, rgba)
+                      // Template é BGR (imread/imdecode); casa o espaço de canais antes do match.
+                      Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
+                      recorte = Mat(bgr, roi)
+                      resultado = Mat()
+                      Imgproc.matchTemplate(recorte, template, resultado, Imgproc.TM_CCOEFF_NORMED)
+                      val mm = Core.minMaxLoc(resultado)
+                      if (mm.maxVal < threshold) return null
+                      val l = regiao.left + mm.maxLoc.x.toInt()
+                      val t = regiao.top + mm.maxLoc.y.toInt()
+                      return Rect(l, t, l + template.cols(), t + template.rows())
+                  } finally {
+                      resultado?.release()
+                      recorte?.release()
+                      bgr.release()
+                      rgba.release()
+                  }
+              }
+
+              fun regiaoBusca(w: Int, h: Int): Rect = Rect(
+                  (w * Config.REGIAO_LEFT).toInt().coerceIn(0, w),
+                  (h * Config.REGIAO_TOP).toInt().coerceIn(0, h),
+                  (w * Config.REGIAO_RIGHT).toInt().coerceIn(0, w),
+                  (h * Config.REGIAO_BOTTOM).toInt().coerceIn(0, h)
+              )
+          }
+          ''',
+          }
+          for p, c in FILES.items():
+              os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+              with open(p, 'w', encoding='utf-8', newline='\n') as f:
+                  f.write(c)
+          print('gerados:', len(FILES))
+          PYEOF
+
+      - name: Gerar projeto (recursos)
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          FILES = {
+          "app/src/main/res/drawable/ic_launcher_foreground.xml": r'''<!-- app/src/main/res/drawable/ic_launcher_foreground.xml -->
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:fillType="evenOdd"
+                  android:pathData="M54,30a24,24 0 1,0 0,48a24,24 0 1,0 0,-48zM54,38a16,16 0 1,1 0,32a16,16 0 1,1 0,-32zM54,50a4,4 0 1,0 0,8a4,4 0 1,0 0,-8z" />
+          </vector>
+          ''',
+          "app/src/main/res/drawable/overlay_bg.xml": r'''<!-- app/src/main/res/drawable/overlay_bg.xml -->
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <solid android:color="#E614141C" />
+              <corners android:radius="14dp" />
+              <stroke
+                  android:width="1dp"
+                  android:color="#40FFFFFF" />
+          </shape>
+          ''',
+          "app/src/main/res/layout/activity_main.xml": r'''<!-- app/src/main/res/layout/activity_main.xml -->
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="16dp">
+
+                  <TextView
+                      android:id="@+id/tvStatusA11y"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:textSize="16sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/tvStatusOverlay"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:textSize="16sp" />
+
+                  <Button
+                      android:id="@+id/btnAcessibilidade"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="@string/btn_abrir_a11y" />
+
+                  <Button
+                      android:id="@+id/btnOverlayPerm"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/btn_permissao_overlay" />
+
+                  <Button
+                      android:id="@+id/btnOverlayToggle"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/btn_iniciar_overlay" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:text="@string/label_coords"
+                      android:textStyle="bold" />
+
+                  <EditText
+                      android:id="@+id/etAtaqueX"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:hint="@string/hint_ataque_x"
+                      android:importantForAutofill="no"
+                      android:inputType="numberDecimal" />
+
+                  <EditText
+                      android:id="@+id/etAtaqueY"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:hint="@string/hint_ataque_y"
+                      android:importantForAutofill="no"
+                      android:inputType="numberDecimal" />
+
+                  <EditText
+                      android:id="@+id/etTrainX"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:hint="@string/hint_train_x"
+                      android:importantForAutofill="no"
+                      android:inputType="numberDecimal" />
+
+                  <EditText
+                      android:id="@+id/etTrainY"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:hint="@string/hint_train_y"
+                      android:importantForAutofill="no"
+                      android:inputType="numberDecimal" />
+
+                  <EditText
+                      android:id="@+id/etThreshold"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:hint="@string/hint_threshold"
+                      android:importantForAutofill="no"
+                      android:inputType="numberDecimal" />
+
+                  <RadioGroup
+                      android:id="@+id/rgModo"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:orientation="horizontal">
+
+                      <RadioButton
+                          android:id="@+id/rbFarm"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="@string/modo_farm" />
+
+                      <RadioButton
+                          android:id="@+id/rbTrain"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginStart="24dp"
+                          android:text="@string/modo_train" />
+                  </RadioGroup>
+
+                  <Button
+                      android:id="@+id/btnSalvar"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="@string/btn_salvar" />
+              </LinearLayout>
+          </ScrollView>
+          ''',
+          "app/src/main/res/layout/overlay_layout.xml": r'''<!-- app/src/main/res/layout/overlay_layout.xml -->
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="wrap_content"
+              android:layout_height="wrap_content"
+              android:background="@drawable/overlay_bg"
+              android:orientation="vertical"
+              android:padding="10dp">
+
+              <TextView
+                  android:id="@+id/tvArrastar"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:padding="4dp"
+                  android:text="@string/overlay_mover"
+                  android:textColor="#9AA0A6"
+                  android:textSize="12sp" />
+
+              <TextView
+                  android:id="@+id/tvPainelStatus"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:textColor="#FFFFFF"
+                  android:textSize="13sp" />
+
+              <LinearLayout
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="6dp"
+                  android:orientation="horizontal">
+
+                  <com.google.android.material.button.MaterialButton
+                      android:id="@+id/btnMotor"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:insetTop="4dp"
+                      android:insetBottom="4dp"
+                      android:minWidth="0dp"
+                      android:text="@string/overlay_iniciar"
+                      android:textSize="12sp" />
+
+                  <com.google.android.material.button.MaterialButton
+                      android:id="@+id/btnModo"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="6dp"
+                      android:insetTop="4dp"
+                      android:insetBottom="4dp"
+                      android:minWidth="0dp"
+                      android:text="@string/modo_farm"
+                      android:textSize="12sp" />
+
+                  <com.google.android.material.button.MaterialButton
+                      android:id="@+id/btnFechar"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="6dp"
+                      android:insetTop="4dp"
+                      android:insetBottom="4dp"
+                      android:minWidth="0dp"
+                      android:text="@string/overlay_fechar"
+                      android:textSize="12sp" />
+              </LinearLayout>
+          </LinearLayout>
+          ''',
+          "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml": r'''<!-- app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml -->
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+              <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          ''',
+          "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml": r'''<!-- app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml -->
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+              <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          ''',
+          "app/src/main/res/values/colors.xml": r'''<!-- app/src/main/res/values/colors.xml -->
+          <resources>
+              <color name="ic_launcher_background">#263238</color>
+          </resources>
+          ''',
+          "app/src/main/res/values/strings.xml": r'''<!-- app/src/main/res/values/strings.xml -->
+          <resources>
+              <string name="app_name">Rucoy Macro</string>
+              <string name="accessibility_label">Rucoy Macro</string>
+              <string name="accessibility_desc">Executa macros locais no Rucoy Online: captura a tela e dispara toques e arrastos em seu nome. Processamento 100%% local, sem rede.</string>
+
+              <string name="notif_channel_name">Painel do macro</string>
+              <string name="notif_title">Rucoy Macro ativo</string>
+              <string name="notif_text">Painel flutuante em execução</string>
+
+              <string name="fmt_status_a11y">Acessibilidade: %1$s</string>
+              <string name="fmt_status_overlay">Overlay: %1$s</string>
+              <string name="ligado">ligado</string>
+              <string name="desligado">desligado</string>
+
+              <string name="btn_abrir_a11y">Abrir Configurações de Acessibilidade</string>
+              <string name="btn_permissao_overlay">Permitir sobreposição de tela</string>
+              <string name="btn_iniciar_overlay">Iniciar painel flutuante</string>
+              <string name="btn_parar_overlay">Parar painel flutuante</string>
+
+              <string name="label_coords">Coordenadas (dp) e visão</string>
+              <string name="hint_ataque_x">Ataque X (dp)</string>
+              <string name="hint_ataque_y">Ataque Y (dp)</string>
+              <string name="hint_train_x">Alvo fixo TRAIN X (dp)</string>
+              <string name="hint_train_y">Alvo fixo TRAIN Y (dp)</string>
+              <string name="hint_threshold">Threshold do match (0.50–0.99)</string>
+              <string name="modo_farm">FARM</string>
+              <string name="modo_train">TRAIN</string>
+              <string name="btn_salvar">Salvar configuração</string>
+
+              <string name="toast_salvo">Configuração salva</string>
+              <string name="toast_sem_overlay_perm">Conceda a permissão de sobreposição primeiro</string>
+              <string name="toast_ative_a11y">Ative o serviço de acessibilidade primeiro</string>
+              <string name="toast_opencv_falhou">Falha ao carregar o OpenCV</string>
+
+              <string name="overlay_mover">⠿ mover</string>
+              <string name="overlay_iniciar">Iniciar</string>
+              <string name="overlay_parar">Parar</string>
+              <string name="overlay_fechar">✕</string>
+              <string name="fmt_painel_status">%1$s • ciclos %2$d • alvos %3$d • %4$s</string>
+              <string name="fmt_pausa_humana">Pausa humana • %1$d ciclos concluídos</string>
+          </resources>
+          ''',
+          "app/src/main/res/values/themes.xml": r'''<!-- app/src/main/res/values/themes.xml -->
+          <resources>
+              <style name="Theme.RucoyMacro" parent="Theme.Material3.DayNight.NoActionBar" />
+          </resources>
+          ''',
+          "app/src/main/res/xml/accessibility_config.xml": r'''<!-- app/src/main/res/xml/accessibility_config.xml -->
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="false"
+              android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
+              android:description="@string/accessibility_desc"
+              android:notificationTimeout="100"
+              android:settingsActivity="com.kai.rucoymacro.MainActivity" />
+          ''',
+          }
+          for p, c in FILES.items():
+              os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+              with open(p, 'w', encoding='utf-8', newline='\n') as f:
+                  f.write(c)
+          print('gerados:', len(FILES))
+          PYEOF
+
+      - name: Gerar wrapper
+        run: gradle wrapper --gradle-version 8.13
+
+      - name: Compilar
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Empacotar fontes (com wrapper e assets gerados)
+        run: zip -r RucoyMacro-source.zip . -x ".git/*" ".gradle/*" "build/*" "app/build/*" ".kotlin/*"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rucoymacro-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rucoymacro-source-zip
+          path: RucoyMacro-source.zip
